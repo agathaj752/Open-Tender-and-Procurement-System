@@ -113,3 +113,73 @@
 (define-read-only (get-all-bids (tender-id uint))
     (map-get? bids { tender-id: tender-id, bidder: tx-sender })
 )
+
+
+(define-constant ERR-NO-BID-EXISTS (err u108))
+(define-constant ERR-BID-LOCKED (err u109))
+
+(define-public (withdraw-bid (tender-id uint))
+    (let (
+        (tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND)))
+        (bid (unwrap! (get-bid tender-id tx-sender) (err ERR-NO-BID-EXISTS)))
+    )
+        (asserts! (is-eq (get status tender) "open") (err ERR-TENDER-CLOSED))
+        (asserts! (< stacks-block-height (get deadline tender)) (err ERR-DEADLINE-PASSED))
+        (map-delete bids { tender-id: tender-id, bidder: tx-sender })
+        (ok true)
+    )
+)
+
+
+(define-map tender-categories 
+    { tender-id: uint }
+    { category: (string-ascii 50) }
+)
+
+(define-public (create-tender-with-category 
+    (title (string-ascii 100)) 
+    (description (string-ascii 500)) 
+    (deadline uint) 
+    (minimum-bid uint)
+    (category (string-ascii 50)))
+    (let ((tender-id (+ (var-get tender-counter) u1)))
+        (if (> deadline stacks-block-height)
+            (begin
+                (map-set tenders
+                    { tender-id: tender-id }
+                    {
+                        title: title,
+                        description: description,
+                        owner: tx-sender,
+                        deadline: deadline,
+                        minimum-bid: minimum-bid,
+                        status: "open",
+                        winner: none
+                    }
+                )
+                (map-set tender-categories
+                    { tender-id: tender-id }
+                    { category: category }
+                )
+                (var-set tender-counter tender-id)
+                (ok tender-id))
+            (err ERR-DEADLINE-PASSED)
+        )
+    )
+)
+
+(define-read-only (get-tender-category (tender-id uint))
+    (map-get? tender-categories { tender-id: tender-id })
+)
+
+
+(define-public (update-tender-category (tender-id uint) (new-category (string-ascii 50)))
+    (let ((tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND))))
+        (asserts! (is-eq tx-sender (get owner tender)) (err ERR-NOT-AUTHORIZED))
+        (map-set tender-categories
+            { tender-id: tender-id }
+            { category: new-category }
+        )
+        (ok true)
+    )
+)
