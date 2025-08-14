@@ -843,3 +843,326 @@
         (ok true)
     )
 )
+
+;; Insurance & Bonding System Constants
+(define-constant ERR-INSURANCE-NOT-FOUND (err u301))
+(define-constant ERR-INVALID-POLICY-TYPE (err u302))
+(define-constant ERR-INSUFFICIENT-PREMIUM (err u303))
+(define-constant ERR-CLAIM-ALREADY-EXISTS (err u304))
+(define-constant ERR-CLAIM-NOT-ELIGIBLE (err u305))
+(define-constant ERR-INSURANCE-EXPIRED (err u306))
+(define-constant ERR-CLAIM-PROCESSING-FAILED (err u307))
+(define-constant ERR-INVALID-COVERAGE-AMOUNT (err u308))
+
+;; Insurance system variables
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var base-premium-rate uint u5) ;; 5% base rate
+(define-data-var claim-processing-fee uint u2) ;; 2% processing fee
+
+;; Insurance policy storage
+(define-map insurance-policies
+    { policy-id: uint }
+    {
+        tender-id: uint,
+        policyholder: principal,
+        policy-type: (string-ascii 20), ;; "performance" or "completion"
+        coverage-amount: uint,
+        premium-paid: uint,
+        start-block: uint,
+        expiry-block: uint,
+        active: bool,
+        claims-count: uint
+    }
+)
+
+;; Claims tracking
+(define-map insurance-claims
+    { claim-id: uint }
+    {
+        policy-id: uint,
+        claimant: principal,
+        claim-amount: uint,
+        claim-reason: (string-ascii 300),
+        submitted-at: uint,
+        status: (string-ascii 20), ;; "pending", "approved", "denied", "paid"
+        evidence-hash: (optional (string-ascii 64)),
+        processed-at: (optional uint),
+        payout-amount: (optional uint)
+    }
+)
+
+;; Risk assessment profiles
+(define-map user-risk-profiles
+    { user: principal }
+    {
+        risk-score: uint, ;; 1-100 scale, lower is better
+        total-policies: uint,
+        successful-completions: uint,
+        failed-projects: uint,
+        total-claims: uint,
+        last-updated: uint
+    }
+)
+
+;; Counter variables
+(define-data-var policy-counter uint u0)
+(define-data-var claim-counter uint u0)
+
+;; Calculate risk-adjusted premium based on user reputation and tender value
+(define-private (calculate-premium (user principal) (coverage-amount uint) (policy-type (string-ascii 20)))
+    (let (
+        (base-rate (var-get base-premium-rate))
+        (user-reputation (get-user-reputation user))
+        (risk-profile (default-to 
+            { risk-score: u50, total-policies: u0, successful-completions: u0, failed-projects: u0, total-claims: u0, last-updated: u0 }
+            (map-get? user-risk-profiles { user: user })
+        ))
+    )
+        (let (
+            (reputation-factor (match user-reputation
+                rep-data (if (> (get total-ratings rep-data) u0)
+                    (if (>= (get average-rating rep-data) u400) u80  ;; Good rating = 20% discount
+                    (if (>= (get average-rating rep-data) u300) u90  ;; Average rating = 10% discount
+                    (if (>= (get average-rating rep-data) u200) u100 ;; Poor rating = no discount
+                    u120)))  ;; Very poor rating = 20% surcharge
+                    u110) ;; No rating = 10% surcharge
+                u110)) ;; No reputation data = 10% surcharge
+            (risk-factor (if (> (get failed-projects risk-profile) u0)
+                (+ u100 (* (get failed-projects risk-profile) u10)) ;; 10% surcharge per failed project
+                u100))
+            (policy-type-factor (if (is-eq policy-type "performance") u100 u120)) ;; Performance bonds cost 20% less
+            (adjusted-rate (/ (* base-rate reputation-factor risk-factor policy-type-factor) u10000))
+        )
+            (/ (* coverage-amount adjusted-rate) u100)
+        )
+    )
+)
+
+;; Purchase insurance policy for a tender
+(define-public (purchase-insurance (tender-id uint) (policy-type (string-ascii 20)) (coverage-amount uint) (duration-blocks uint))
+    (let (
+        (tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND)))
+        (policy-id (+ (var-get policy-counter) u1))
+        (premium (calculate-premium tx-sender coverage-amount policy-type))
+        (expiry-block (+ stacks-block-height duration-blocks))
+    )
+        ;; Validate inputs
+        (asserts! (or (is-eq policy-type "performance") (is-eq policy-type "completion")) (err ERR-INVALID-POLICY-TYPE))
+        (asserts! (and (> coverage-amount u0) (<= coverage-amount (* (get minimum-bid tender) u5))) (err ERR-INVALID-COVERAGE-AMOUNT))
+        (asserts! (> duration-blocks u144) (err ERR-INSURANCE-EXPIRED)) ;; Minimum 1 day
+        
+        ;; Transfer premium to insurance pool
+        (unwrap! (stx-transfer? premium tx-sender (as-contract tx-sender)) (err ERR-INSUFFICIENT-PREMIUM))
+        
+        ;; Create insurance policy
+        (map-set insurance-policies
+            { policy-id: policy-id }
+            {
+                tender-id: tender-id,
+                policyholder: tx-sender,
+                policy-type: policy-type,
+                coverage-amount: coverage-amount,
+                premium-paid: premium,
+                start-block: stacks-block-height,
+                expiry-block: expiry-block,
+                active: true,
+                claims-count: u0
+            }
+        )
+        
+        ;; Update insurance pool balance
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium))
+        
+        ;; Update user risk profile
+        (unwrap! (update-user-risk-profile tx-sender) (err ERR-CLAIM-PROCESSING-FAILED))
+        
+        ;; Update counter
+        (var-set policy-counter policy-id)
+        
+        (ok policy-id)
+    )
+)
+
+;; Submit insurance claim
+(define-public (submit-claim (policy-id uint) (claim-amount uint) (claim-reason (string-ascii 300)) (evidence-hash (string-ascii 64)))
+    (let (
+        (policy (unwrap! (map-get? insurance-policies { policy-id: policy-id }) (err ERR-INSURANCE-NOT-FOUND)))
+        (claim-id (+ (var-get claim-counter) u1))
+        (tender (unwrap! (get-tender (get tender-id policy)) (err ERR-NOT-FOUND)))
+    )
+        ;; Validate claim eligibility
+        (asserts! (is-eq tx-sender (get policyholder policy)) (err ERR-NOT-AUTHORIZED))
+        (asserts! (get active policy) (err ERR-INSURANCE-EXPIRED))
+        (asserts! (< stacks-block-height (get expiry-block policy)) (err ERR-INSURANCE-EXPIRED))
+        (asserts! (<= claim-amount (get coverage-amount policy)) (err ERR-INVALID-COVERAGE-AMOUNT))
+        
+        ;; Validate claim conditions based on policy type
+        (if (is-eq (get policy-type policy) "performance")
+            ;; Performance bond claims require tender to be completed or cancelled
+            (asserts! (or (is-eq (get status tender) "completed") (is-eq (get status tender) "cancelled")) (err ERR-CLAIM-NOT-ELIGIBLE))
+            ;; Completion insurance claims require bidder to be winner and project incomplete
+            (begin
+                (asserts! (is-some (get winner tender)) (err ERR-CLAIM-NOT-ELIGIBLE))
+                (asserts! (is-eq tx-sender (unwrap-panic (get winner tender))) (err ERR-NOT-AUTHORIZED))
+                (asserts! (not (is-eq (get status tender) "completed")) (err ERR-CLAIM-NOT-ELIGIBLE))
+            )
+        )
+        
+        ;; Create claim record
+        (map-set insurance-claims
+            { claim-id: claim-id }
+            {
+                policy-id: policy-id,
+                claimant: tx-sender,
+                claim-amount: claim-amount,
+                claim-reason: claim-reason,
+                submitted-at: stacks-block-height,
+                status: "pending",
+                evidence-hash: (some evidence-hash),
+                processed-at: none,
+                payout-amount: none
+            }
+        )
+        
+        ;; Update policy claims count
+        (map-set insurance-policies
+            { policy-id: policy-id }
+            (merge policy { claims-count: (+ (get claims-count policy) u1) })
+        )
+        
+        ;; Update counter
+        (var-set claim-counter claim-id)
+        
+        (ok claim-id)
+    )
+)
+
+;; Process insurance claim (automated based on conditions)
+(define-public (process-claim (claim-id uint) (approve bool) (payout-percentage uint))
+    (let (
+        (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) (err ERR-INSURANCE-NOT-FOUND)))
+        (policy (unwrap! (map-get? insurance-policies { policy-id: (get policy-id claim) }) (err ERR-INSURANCE-NOT-FOUND)))
+        (tender (unwrap! (get-tender (get tender-id policy)) (err ERR-NOT-FOUND)))
+        (processing-fee-amount (/ (* (get claim-amount claim) (var-get claim-processing-fee)) u100))
+        (payout-amount (if approve 
+            (- (/ (* (get claim-amount claim) payout-percentage) u100) processing-fee-amount)
+            u0))
+    )
+        ;; Only tender owner or policyholder can process certain claims
+        (asserts! (or (is-eq tx-sender (get owner tender)) (is-eq tx-sender (get policyholder policy))) (err ERR-NOT-AUTHORIZED))
+        (asserts! (is-eq (get status claim) "pending") (err ERR-CLAIM-ALREADY-EXISTS))
+        (asserts! (<= payout-percentage u100) (err ERR-INVALID-COVERAGE-AMOUNT))
+        (asserts! (<= payout-amount (var-get insurance-pool-balance)) (err ERR-INSUFFICIENT-ESCROW))
+        
+        ;; Update claim status
+        (map-set insurance-claims
+            { claim-id: claim-id }
+            (merge claim {
+                status: (if approve "approved" "denied"),
+                processed-at: (some stacks-block-height),
+                payout-amount: (if approve (some payout-amount) none)
+            })
+        )
+        
+        ;; Process payout if approved
+        (if approve
+            (begin
+                (unwrap! (as-contract (stx-transfer? payout-amount tx-sender (get claimant claim))) (err ERR-CLAIM-PROCESSING-FAILED))
+                (var-set insurance-pool-balance (- (var-get insurance-pool-balance) payout-amount))
+                (unwrap! (update-user-risk-profile-after-claim (get claimant claim) approve) (err ERR-CLAIM-PROCESSING-FAILED))
+            )
+            (unwrap! (update-user-risk-profile-after-claim (get claimant claim) approve) (err ERR-CLAIM-PROCESSING-FAILED))
+        )
+        
+        (ok payout-amount)
+    )
+)
+
+;; Update user risk profile
+(define-private (update-user-risk-profile (user principal))
+    (let (
+        (current-profile (default-to 
+            { risk-score: u50, total-policies: u0, successful-completions: u0, failed-projects: u0, total-claims: u0, last-updated: u0 }
+            (map-get? user-risk-profiles { user: user })
+        ))
+        (user-reputation (get-user-reputation user))
+    )
+        (map-set user-risk-profiles
+            { user: user }
+            (merge current-profile {
+                total-policies: (+ (get total-policies current-profile) u1),
+                risk-score: (match user-reputation
+                    rep-data (if (>= (get average-rating rep-data) u400) u30  ;; Excellent rating
+                             (if (>= (get average-rating rep-data) u300) u40  ;; Good rating
+                             (if (>= (get average-rating rep-data) u200) u60  ;; Average rating
+                             u80)))  ;; Poor rating
+                    u70), ;; No reputation
+                last-updated: stacks-block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Update risk profile after claim processing
+(define-private (update-user-risk-profile-after-claim (user principal) (claim-approved bool))
+    (let (
+        (current-profile (default-to 
+            { risk-score: u50, total-policies: u0, successful-completions: u0, failed-projects: u0, total-claims: u0, last-updated: u0 }
+            (map-get? user-risk-profiles { user: user })
+        ))
+    )
+        (map-set user-risk-profiles
+            { user: user }
+            (merge current-profile {
+                total-claims: (+ (get total-claims current-profile) u1),
+                failed-projects: (if claim-approved (+ (get failed-projects current-profile) u1) (get failed-projects current-profile)),
+                risk-score: (if claim-approved 
+                    (if (> (+ (get risk-score current-profile) u10) u100) u100 (+ (get risk-score current-profile) u10))  ;; Increase risk score
+                    (if (< (- (get risk-score current-profile) u5) u10) u10 (- (get risk-score current-profile) u5))),   ;; Decrease risk score slightly
+                last-updated: stacks-block-height
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions for insurance system
+(define-read-only (get-insurance-policy (policy-id uint))
+    (map-get? insurance-policies { policy-id: policy-id })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+    (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-user-risk-profile (user principal))
+    (map-get? user-risk-profiles { user: user })
+)
+
+(define-read-only (get-insurance-pool-balance)
+    (var-get insurance-pool-balance)
+)
+
+(define-read-only (calculate-insurance-premium (user principal) (coverage-amount uint) (policy-type (string-ascii 20)))
+    (calculate-premium user coverage-amount policy-type)
+)
+
+;; Check if user is eligible for insurance based on risk profile
+(define-read-only (is-insurance-eligible (user principal) (coverage-amount uint))
+    (let (
+        (risk-profile (default-to 
+            { risk-score: u50, total-policies: u0, successful-completions: u0, failed-projects: u0, total-claims: u0, last-updated: u0 }
+            (map-get? user-risk-profiles { user: user })
+        ))
+        (max-coverage (/ (* coverage-amount u200) (get risk-score risk-profile))) ;; Higher risk = lower max coverage
+    )
+        (and 
+            (< (get risk-score risk-profile) u90)  ;; Risk score must be below 90
+            (< (get failed-projects risk-profile) u5)  ;; Less than 5 failed projects
+            (>= max-coverage coverage-amount)  ;; Coverage amount within limits
+        )
+    )
+)
+
+
