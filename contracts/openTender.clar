@@ -1165,4 +1165,252 @@
     )
 )
 
+;; =====================================
+;; TENDER AMENDMENT SYSTEM
+;; =====================================
+
+;; Amendment System Constants
+(define-constant ERR-AMENDMENT-LIMIT-EXCEEDED (err u401))
+(define-constant ERR-INVALID-AMENDMENT-TYPE (err u402))
+(define-constant ERR-AMENDMENT-NOT-ALLOWED (err u403))
+(define-constant ERR-DEADLINE-TOO-SHORT (err u404))
+(define-constant ERR-BID-DECREASE-NOT-ALLOWED (err u405))
+
+;; Amendment system variables
+(define-data-var max-amendments-per-tender uint u3)
+(define-data-var amendment-counter uint u0)
+(define-data-var min-deadline-extension uint u144) ;; Minimum 1 day extension
+
+;; Track tender amendments
+(define-map tender-amendments
+    { tender-id: uint }
+    {
+        amendment-count: uint,
+        last-amended-at: uint,
+        major-amendments: uint  ;; Amendments that affect bidding conditions
+    }
+)
+
+;; Store amendment history
+(define-map amendment-history
+    { amendment-id: uint }
+    {
+        tender-id: uint,
+        amendment-type: (string-ascii 20), ;; "deadline", "description", "min-bid", "category"
+        old-value: (string-ascii 200),
+        new-value: (string-ascii 200),
+        reason: (string-ascii 300),
+        amended-by: principal,
+        amended-at: uint,
+        bidder-notification-sent: bool
+    }
+)
+
+;; Track bidder acknowledgments of amendments
+(define-map amendment-acknowledgments
+    { tender-id: uint, bidder: principal }
+    {
+        last-acknowledged-amendment: uint,
+        withdrawal-grace-period: uint  ;; Blocks until withdrawal is allowed
+    }
+)
+
+;; Extend tender deadline
+(define-public (amend-tender-deadline (tender-id uint) (new-deadline uint) (reason (string-ascii 300)))
+    (let (
+        (tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND)))
+        (amendment-data (default-to { amendment-count: u0, last-amended-at: u0, major-amendments: u0 }
+                                   (map-get? tender-amendments { tender-id: tender-id })))
+        (amendment-id (+ (var-get amendment-counter) u1))
+        (current-deadline (get deadline tender))
+    )
+        ;; Validation checks
+        (asserts! (is-eq tx-sender (get owner tender)) (err ERR-NOT-AUTHORIZED))
+        (asserts! (is-eq (get status tender) "open") (err ERR-TENDER-CLOSED))
+        (asserts! (< (get amendment-count amendment-data) (var-get max-amendments-per-tender)) (err ERR-AMENDMENT-LIMIT-EXCEEDED))
+        (asserts! (>= new-deadline (+ current-deadline (var-get min-deadline-extension))) (err ERR-DEADLINE-TOO-SHORT))
+        (asserts! (< stacks-block-height current-deadline) (err ERR-DEADLINE-PASSED))
+        
+        ;; Update tender deadline
+        (map-set tenders
+            { tender-id: tender-id }
+            (merge tender { deadline: new-deadline })
+        )
+        
+        ;; Record amendment
+        (map-set amendment-history
+            { amendment-id: amendment-id }
+            {
+                tender-id: tender-id,
+                amendment-type: "deadline",
+                old-value: (unwrap-panic (as-max-len? (int-to-ascii current-deadline) u200)),
+                new-value: (unwrap-panic (as-max-len? (int-to-ascii new-deadline) u200)),
+                reason: reason,
+                amended-by: tx-sender,
+                amended-at: stacks-block-height,
+                bidder-notification-sent: true
+            }
+        )
+        
+        ;; Update amendment tracking
+        (map-set tender-amendments
+            { tender-id: tender-id }
+            {
+                amendment-count: (+ (get amendment-count amendment-data) u1),
+                last-amended-at: stacks-block-height,
+                major-amendments: (+ (get major-amendments amendment-data) u1)
+            }
+        )
+        
+        ;; Increment amendment counter
+        (var-set amendment-counter amendment-id)
+        
+        (ok amendment-id)
+    )
+)
+
+;; Amend tender description for clarification
+(define-public (amend-tender-description (tender-id uint) (new-description (string-ascii 500)) (reason (string-ascii 300)))
+    (let (
+        (tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND)))
+        (amendment-data (default-to { amendment-count: u0, last-amended-at: u0, major-amendments: u0 }
+                                   (map-get? tender-amendments { tender-id: tender-id })))
+        (amendment-id (+ (var-get amendment-counter) u1))
+    )
+        ;; Validation checks
+        (asserts! (is-eq tx-sender (get owner tender)) (err ERR-NOT-AUTHORIZED))
+        (asserts! (is-eq (get status tender) "open") (err ERR-TENDER-CLOSED))
+        (asserts! (< (get amendment-count amendment-data) (var-get max-amendments-per-tender)) (err ERR-AMENDMENT-LIMIT-EXCEEDED))
+        (asserts! (< stacks-block-height (get deadline tender)) (err ERR-DEADLINE-PASSED))
+        
+        ;; Update tender description
+        (map-set tenders
+            { tender-id: tender-id }
+            (merge tender { description: new-description })
+        )
+        
+        ;; Record amendment
+        (map-set amendment-history
+            { amendment-id: amendment-id }
+            {
+                tender-id: tender-id,
+                amendment-type: "description",
+                old-value: (unwrap-panic (as-max-len? (get description tender) u200)),
+                new-value: (unwrap-panic (as-max-len? new-description u200)),
+                reason: reason,
+                amended-by: tx-sender,
+                amended-at: stacks-block-height,
+                bidder-notification-sent: true
+            }
+        )
+        
+        ;; Update amendment tracking (minor amendment - doesn't affect bidding conditions)
+        (map-set tender-amendments
+            { tender-id: tender-id }
+            {
+                amendment-count: (+ (get amendment-count amendment-data) u1),
+                last-amended-at: stacks-block-height,
+                major-amendments: (get major-amendments amendment-data)
+            }
+        )
+        
+        ;; Increment amendment counter
+        (var-set amendment-counter amendment-id)
+        
+        (ok amendment-id)
+    )
+)
+
+;; Allow bidders to withdraw within grace period after major amendments
+(define-public (withdraw-after-amendment (tender-id uint))
+    (let (
+        (tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND)))
+        (bid (unwrap! (get-bid tender-id tx-sender) (err ERR-NO-BID-EXISTS)))
+        (amendment-data (unwrap! (map-get? tender-amendments { tender-id: tender-id }) (err ERR-AMENDMENT-LIMIT-EXCEEDED)))
+        (acknowledgment (map-get? amendment-acknowledgments { tender-id: tender-id, bidder: tx-sender }))
+        (deposit (map-get? bid-deposits { tender-id: tender-id, bidder: tx-sender }))
+    )
+        ;; Check if there have been major amendments
+        (asserts! (> (get major-amendments amendment-data) u0) (err ERR-AMENDMENT-NOT-ALLOWED))
+        (asserts! (is-eq (get status tender) "open") (err ERR-TENDER-CLOSED))
+        
+        ;; Check if within grace period (72 blocks = ~12 hours)
+        (asserts! (< (- stacks-block-height (get last-amended-at amendment-data)) u72) (err ERR-DEADLINE-PASSED))
+        
+        ;; Remove bid
+        (map-delete bids { tender-id: tender-id, bidder: tx-sender })
+        
+        ;; Refund deposit if exists
+        (match deposit
+            deposit-data
+            (begin
+                (unwrap! (as-contract (stx-transfer? (get amount deposit-data) tx-sender tx-sender)) (err ERR-REFUND-FAILED))
+                (map-set bid-deposits
+                    { tender-id: tender-id, bidder: tx-sender }
+                    (merge deposit-data { refunded: true })
+                )
+            )
+            true
+        )
+        
+        (ok true)
+    )
+)
+
+;; Acknowledge amendments (bidders can explicitly acknowledge to show they agree)
+(define-public (acknowledge-amendments (tender-id uint))
+    (let (
+        (tender (unwrap! (get-tender tender-id) (err ERR-NOT-FOUND)))
+        (bid (unwrap! (get-bid tender-id tx-sender) (err ERR-NO-BID-EXISTS)))
+        (amendment-data (unwrap! (map-get? tender-amendments { tender-id: tender-id }) (err ERR-AMENDMENT-LIMIT-EXCEEDED)))
+    )
+        (asserts! (is-eq (get status tender) "open") (err ERR-TENDER-CLOSED))
+        (asserts! (> (get amendment-count amendment-data) u0) (err ERR-AMENDMENT-NOT-ALLOWED))
+        
+        (map-set amendment-acknowledgments
+            { tender-id: tender-id, bidder: tx-sender }
+            {
+                last-acknowledged-amendment: (get amendment-count amendment-data),
+                withdrawal-grace-period: (+ stacks-block-height u72)
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+;; Read-only functions for amendment system
+(define-read-only (get-tender-amendments (tender-id uint))
+    (map-get? tender-amendments { tender-id: tender-id })
+)
+
+(define-read-only (get-amendment-history (amendment-id uint))
+    (map-get? amendment-history { amendment-id: amendment-id })
+)
+
+(define-read-only (get-bidder-acknowledgment (tender-id uint) (bidder principal))
+    (map-get? amendment-acknowledgments { tender-id: tender-id, bidder: bidder })
+)
+
+;; Get all amendments for a tender (returns list of amendment IDs)
+(define-read-only (get-tender-amendment-ids (tender-id uint))
+    (match (map-get? tender-amendments { tender-id: tender-id })
+        amendment-data (some (get amendment-count amendment-data))
+        none
+    )
+)
+
+;; Check if bidder can withdraw due to amendments
+(define-read-only (can-withdraw-after-amendment (tender-id uint) (bidder principal))
+    (match (map-get? tender-amendments { tender-id: tender-id })
+        amendment-data
+        (and 
+            (> (get major-amendments amendment-data) u0)
+            (< (- stacks-block-height (get last-amended-at amendment-data)) u72)
+            (is-some (get-bid tender-id bidder))
+        )
+        false
+    )
+)
+
 
